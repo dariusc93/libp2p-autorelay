@@ -1,0 +1,24 @@
+[package]
+name = "libp2p-autorelay"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+libp2p = { version = "0.50", features = ["relay"] }
+# TODO: Use Cid and Multihash directly
+# libipld = "0.15"
+thiserror = "1.0"
+anyhow = "1.0"
+futures = "0.3"
+wasm-timer = "0.2"
+log = "0.4"
+void = "1.0"
+rand = "0.8"
+
+[dev-dependencies]
+libp2p = { version = "0.50", features = ["full"] }
+async-std = { version = "1", features = ["attributes"] }
+clap = { version = "4.0", features = ["derive"] }
+env_logger = "0.10"
