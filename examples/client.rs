@@ -84,7 +84,7 @@ async fn main() -> anyhow::Result<()> {
         ping: Ping::new(Default::default()),
         identify: Identify::new({
             let mut config =
-                identify::Config::new("/TODO/0.0.1".to_string(), local_keypair.public());
+                identify::Config::new("/autorelay/0.1.0".to_string(), local_keypair.public());
             config.push_listen_addr_updates = true;
             config
         }),
