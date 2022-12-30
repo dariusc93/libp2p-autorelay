@@ -50,9 +50,17 @@ struct Opts {
     #[clap(long)]
     candidates: Vec<Multiaddr>,
 
-    /// Enables kademla for getting relays from DHT
+    /// Disables kad protocol
     #[clap(long)]
-    use_kad: bool,
+    disable_kad: bool,
+
+    /// Bootstrap DHT
+    #[clap(long)]
+    bootstrap: bool,
+
+    /// Random walk
+    #[clap(long)]
+    random_walk: bool,
 }
 
 #[async_std::main]
@@ -85,7 +93,7 @@ async fn main() -> anyhow::Result<()> {
         }),
         relay_client,
         autorelay: AutoRelay::default(),
-        kad: Toggle::from(opts.use_kad.then_some({
+        kad: Toggle::from((!opts.disable_kad).then_some({
             let store = MemoryStore::new(local_peer_id);
             Kademlia::new(local_peer_id, store)
         })),
@@ -122,10 +130,13 @@ async fn main() -> anyhow::Result<()> {
         let (peer_id, addr) = extract_peer_id_from_multiaddr(addr);
         let peer_id = peer_id.expect("Require p2p protocol in multiaddr");
 
-        swarm.behaviour_mut().autorelay.add_static_relay(peer_id, addr)?;
+        swarm
+            .behaviour_mut()
+            .autorelay
+            .add_static_relay(peer_id, addr)?;
     }
 
-    if opts.use_kad {
+    if !opts.disable_kad {
         // Use libp2p bootstrap for now
         // TODO: Make apart of cli options for bootstrap
         let bootaddr = Multiaddr::from_str("/dnsaddr/bootstrap.libp2p.io")?;
@@ -143,12 +154,22 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
-        // TODO: Give option to use providers instead of bootstrapping (and randomly walking DHT)
-        swarm
-            .behaviour_mut()
-            .kad
-            .as_mut()
-            .map(|kad| kad.bootstrap());
+        if opts.bootstrap {
+            // TODO: Give option to use providers instead of bootstrapping (and randomly walking DHT)
+            swarm
+                .behaviour_mut()
+                .kad
+                .as_mut()
+                .map(|kad| kad.bootstrap());
+        }
+
+        if opts.random_walk {
+            swarm
+                .behaviour_mut()
+                .kad
+                .as_mut()
+                .map(|kad| kad.get_closest_peers(PeerId::random()));
+        }
     }
 
     let mut relay_timer = wasm_timer::Interval::new(Duration::from_secs(5)).fuse();
