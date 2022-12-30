@@ -79,7 +79,7 @@ pub enum Nat {
 
 #[allow(dead_code)]
 //Note: `candidates_without_addr` is not in use but is meant to be used for fetching from
-//      kad providers (or just sending peers through channels that will be used as a relay) 
+//      kad providers (or just sending peers through channels that will be used as a relay)
 pub struct AutoRelay {
     events: VecDeque<NetworkBehaviourAction>,
 
@@ -96,6 +96,8 @@ pub struct AutoRelay {
     reservation: HashMap<ListenerId, Multiaddr>,
 
     reservation_peer: HashSet<PeerId>,
+
+    pending_reservation_peer: HashSet<PeerId>,
 
     channel: Option<UnboundedReceiver<PeerId>>,
 
@@ -128,6 +130,7 @@ impl Default for AutoRelay {
             channel: None,
             reservation: Default::default(),
             reservation_peer: Default::default(),
+            pending_reservation_peer: Default::default(),
             blacklist: Default::default(),
             interval: Interval::new_at(
                 Instant::now() + Duration::from_secs(10),
@@ -239,7 +242,7 @@ impl AutoRelay {
     pub fn avg_rtt(&self, peer_id: PeerId) -> Option<u128> {
         let rtts = self.candidates_rtt.get(&peer_id).copied()?;
         let avg: u128 = rtts.iter().map(|duration| duration.as_millis()).sum();
-        // used in case we cant produce a full avg 
+        // used in case we cant produce a full avg
         let div = rtts.iter().filter(|i| !i.is_zero()).count() as u128;
         let avg = avg / div;
         Some(avg)
@@ -254,13 +257,13 @@ impl AutoRelay {
     }
 
     pub fn select_candidate(&mut self, peer_id: PeerId) {
-        if let Some(addrs) = self.candidates.get(&peer_id) {
-            self.events.push_back(NetworkBehaviourAction::GenerateEvent(
-                Event::ReservationSelected {
-                    peer_id,
-                    addrs: addrs.clone(),
-                },
-            ));
+        // We remove to prevent duplications
+        if let Some(addrs) = self.candidates.get(&peer_id).cloned() {
+            if self.pending_reservation_peer.insert(peer_id) {
+                self.events.push_back(NetworkBehaviourAction::GenerateEvent(
+                    Event::ReservationSelected { peer_id, addrs },
+                ));
+            }
         }
     }
 
@@ -308,7 +311,10 @@ impl AutoRelay {
         let mut last_rtt: Option<Duration> = None;
 
         for peer_id in self.candidates.keys() {
-            if self.reservation_peer.contains(peer_id) || self.blacklist.contains_key(peer_id) {
+            if self.reservation_peer.contains(peer_id)
+                || self.blacklist.contains_key(peer_id)
+                || self.pending_reservation_peer.contains(peer_id)
+            {
                 continue;
             }
             let Some(avg_rtt) = self.avg_rtt(*peer_id) else {
@@ -333,6 +339,10 @@ impl AutoRelay {
             warn!("No candidate was found");
             return;
         };
+
+        if self.pending_reservation_peer.contains(&peer_id) {
+            return;
+        }
 
         if self.reservation_peer.get(&peer_id).is_some() {
             return;
@@ -516,14 +526,15 @@ impl NetworkBehaviour for AutoRelay {
             }
         }
     }
-    
+
     fn inject_event(&mut self, _peer_id: PeerId, _connection: ConnectionId, _event: void::Void) {}
 
     fn inject_new_listen_addr(&mut self, id: ListenerId, addr: &Multiaddr) {
+
         if self.reservation.contains_key(&id) {
             return;
         }
-
+            
         if !addr
             .iter()
             .any(|proto| matches!(proto, Protocol::P2pCircuit | Protocol::P2p(_)))
@@ -547,6 +558,7 @@ impl NetworkBehaviour for AutoRelay {
             return;
         };
 
+        self.pending_reservation_peer.remove(&peer_id);
         self.reservation.insert(id, addr);
         self.reservation_peer.insert(peer_id);
     }
