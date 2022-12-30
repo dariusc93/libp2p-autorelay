@@ -47,14 +47,6 @@ struct Opts {
     #[clap(long)]
     secret_key_seed: Option<u8>,
 
-    /// The listening address
-    #[clap(long)]
-    relay_address: Option<Multiaddr>,
-
-    /// Peer ID of the remote peer to hole punch to.
-    #[clap(long)]
-    remote_peer_id: Option<PeerId>,
-
     /// Enables kademla for getting relays from DHT
     #[clap(long)]
     use_kad: bool,

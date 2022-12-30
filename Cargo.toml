@@ -1,8 +1,14 @@
 [package]
 name = "libp2p-autorelay"
-version = "0.1.0"
+version = "0.1.0-alpha.0"
 edition = "2021"
-
+license = "Apache-2.0 OR MIT"
+description = "(WIP) Implementation of autorelay for libp2p"
+repository = "https://github.com/dariusc93/libp2p-autorelay"
+readme = "README.md"
+keywords = ["libp2p", "p2p", "networking"]
+authors = ["Darius Clark"]
+exclude = [".gitignore"]
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
