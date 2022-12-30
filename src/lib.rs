@@ -93,9 +93,7 @@ pub struct AutoRelay {
 
     candidates_connection: HashMap<ConnectionId, Multiaddr>,
 
-    reservation: HashMap<ListenerId, Multiaddr>,
-
-    reservation_peer: HashSet<PeerId>,
+    reservation: HashMap<PeerId, HashMap<ListenerId, Multiaddr>>,
 
     pending_reservation_peer: HashSet<PeerId>,
 
@@ -129,7 +127,6 @@ impl Default for AutoRelay {
             candidates_connection: Default::default(),
             channel: None,
             reservation: Default::default(),
-            reservation_peer: Default::default(),
             pending_reservation_peer: Default::default(),
             blacklist: Default::default(),
             interval: Interval::new_at(
@@ -152,7 +149,7 @@ impl AutoRelay {
     }
 
     pub fn reservation_amount(&self) -> usize {
-        self.reservation_peer.len()
+        self.reservation.len()
     }
 
     // Used to manually add a relay candidate
@@ -216,7 +213,7 @@ impl AutoRelay {
     }
 
     pub fn list_reservation_peers(&self) -> impl Iterator<Item = &PeerId> + '_ {
-        self.reservation_peer.iter()
+        self.reservation.keys()
     }
 
     pub fn in_candidate_threshold(&self) -> bool {
@@ -230,13 +227,8 @@ impl AutoRelay {
     }
 
     pub fn in_reservation_threshold(&self) -> bool {
-        self.reservation_peer.len() >= self.limits.min_reservation
-            && self.reservation_peer.len() <= self.limits.max_reservation
-    }
-
-    pub fn out_of_reservation_threshold(&self) -> bool {
-        self.reservation_peer.len() < self.limits.min_reservation
-            || self.reservation_peer.len() > self.limits.max_reservation
+        self.reservation.len() >= self.limits.min_reservation
+            && self.reservation.len() <= self.limits.max_reservation
     }
 
     pub fn avg_rtt(&self, peer_id: PeerId) -> Option<u128> {
@@ -302,7 +294,7 @@ impl AutoRelay {
             return;
         }
 
-        if self.reservation_peer.len() >= self.limits.max_reservation {
+        if self.reservation.len() >= self.limits.max_reservation {
             warn!("Reservation is at its threshold. Will not continue with select");
             return;
         }
@@ -311,7 +303,7 @@ impl AutoRelay {
         let mut last_rtt: Option<Duration> = None;
 
         for peer_id in self.candidates.keys() {
-            if self.reservation_peer.contains(peer_id)
+            if self.reservation.contains_key(peer_id)
                 || self.blacklist.contains_key(peer_id)
                 || self.pending_reservation_peer.contains(peer_id)
             {
@@ -344,7 +336,7 @@ impl AutoRelay {
             return;
         }
 
-        if self.reservation_peer.get(&peer_id).is_some() {
+        if self.reservation.get(&peer_id).is_some() {
             return;
         }
 
@@ -357,7 +349,7 @@ impl AutoRelay {
             return;
         }
 
-        if self.reservation_peer.len() >= self.limits.max_reservation {
+        if self.reservation.len() >= self.limits.max_reservation {
             warn!("Reservation is at its threshold. Will not continue with selection");
             return;
         }
@@ -371,7 +363,7 @@ impl AutoRelay {
                 return;
             };
 
-        if self.reservation_peer.get(candidate).is_some() {
+        if self.reservation.get(candidate).is_some() {
             return;
         }
 
@@ -439,10 +431,20 @@ impl AutoRelay {
                 error,
                 ..
             } => {
-                self.reservation_peer.remove(&relay_peer_id);
+                let listeners = self.reservation.remove(&relay_peer_id);
                 self.candidates.remove(&relay_peer_id);
                 self.blacklist.insert(relay_peer_id, None);
                 log::error!("Reservation request failed {relay_peer_id}: {error}");
+                if let Some(listeners) = listeners {
+                    for (id, _) in listeners {
+                        self.events.push_back(NetworkBehaviourAction::GenerateEvent(
+                            Event::ReservationRemoved {
+                                peer_id: relay_peer_id,
+                                listener: id,
+                            },
+                        ));
+                    }
+                }
             }
             e => info!("Relay Client Event: {e:?}"),
         }
@@ -530,11 +532,6 @@ impl NetworkBehaviour for AutoRelay {
     fn inject_event(&mut self, _peer_id: PeerId, _connection: ConnectionId, _event: void::Void) {}
 
     fn inject_new_listen_addr(&mut self, id: ListenerId, addr: &Multiaddr) {
-
-        if self.reservation.contains_key(&id) {
-            return;
-        }
-            
         if !addr
             .iter()
             .any(|proto| matches!(proto, Protocol::P2pCircuit | Protocol::P2p(_)))
@@ -558,9 +555,24 @@ impl NetworkBehaviour for AutoRelay {
             return;
         };
 
+        if let Some(listeners) = self.reservation.get(&peer_id) {
+            if listeners.contains_key(&id) {
+                return;
+            }
+        }
+
         self.pending_reservation_peer.remove(&peer_id);
-        self.reservation.insert(id, addr);
-        self.reservation_peer.insert(peer_id);
+
+        match self.reservation.entry(peer_id) {
+            Entry::Occupied(mut entry) => {
+                entry.get_mut().insert(id, addr.clone());
+            }
+            Entry::Vacant(entry) => {
+                let mut listeners = HashMap::new();
+                listeners.insert(id, addr.clone());
+                entry.insert(listeners);
+            }
+        };
     }
 
     fn inject_expired_listen_addr(&mut self, _id: ListenerId, _addr: &Multiaddr) {
