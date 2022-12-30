@@ -193,19 +193,8 @@ async fn main() -> anyhow::Result<()> {
                             log::debug!("{event:?}");
                             swarm.behaviour_mut().autorelay.inject_relay_client_event(event);
                         }
-                        BehaviourEvent::Autorelay(libp2p_autorelay::Event::ReservationSelected { peer_id, addrs }) => {
+                        BehaviourEvent::Autorelay(libp2p_autorelay::Event::ReservationSelected { peer_id }) => {
                             println!("{peer_id} was selected");
-                            for addr in addrs {
-                                let addr = addr
-                                    .with(Protocol::P2p(peer_id.into()))
-                                    .with(Protocol::P2pCircuit);
-
-                                info!("Listening on circuit {addr}");
-
-                                if let Err(e) = swarm.listen_on(addr.clone()) {
-                                    error!("Error listening on {addr}: {e}");
-                                }
-                            }
                         }
                         BehaviourEvent::Identify(identify::Event::Received {
                             peer_id,

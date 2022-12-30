@@ -24,7 +24,6 @@ use wasm_timer::{Instant, Interval};
 pub enum Event {
     ReservationSelected {
         peer_id: PeerId,
-        addrs: Vec<Multiaddr>,
     },
     ReservationRemoved {
         peer_id: PeerId,
@@ -260,9 +259,13 @@ impl AutoRelay {
         // We remove to prevent duplications
         if let Some(addrs) = self.candidates.get(&peer_id).cloned() {
             if self.pending_reservation_peer.insert(peer_id) {
-                self.events.push_back(NetworkBehaviourAction::GenerateEvent(
-                    Event::ReservationSelected { peer_id, addrs },
-                ));
+                for address in addrs {
+                    let address = address
+                        .with(Protocol::P2p(peer_id.into()))
+                        .with(Protocol::P2pCircuit);
+                    self.events
+                        .push_back(NetworkBehaviourAction::ListenOn { address });
+                }
             }
         }
     }
@@ -530,11 +533,9 @@ impl NetworkBehaviour for AutoRelay {
     fn inject_event(&mut self, _peer_id: PeerId, _connection: ConnectionId, _event: void::Void) {}
 
     fn inject_new_listen_addr(&mut self, id: ListenerId, addr: &Multiaddr) {
-
         if self.reservation.contains_key(&id) {
             return;
         }
-            
         if !addr
             .iter()
             .any(|proto| matches!(proto, Protocol::P2pCircuit | Protocol::P2p(_)))
@@ -542,25 +543,24 @@ impl NetworkBehaviour for AutoRelay {
             // We want to make sure that we only collect addresses that contained p2p and p2p-circuit protocols
             return;
         }
-
         let mut addr = addr.clone();
-
         //not sure if we want to store the p2p protocol but for now strip it out
         let Some(Protocol::P2p(_)) = addr.pop() else {
             return;
         };
-
         let Some(Protocol::P2pCircuit) = addr.pop() else {
             return;
         };
-
         let Some(peer_id) = peer_id_from_multiaddr(addr.clone()) else {
             return;
         };
-
         self.pending_reservation_peer.remove(&peer_id);
-        self.reservation.insert(id, addr);
-        self.reservation_peer.insert(peer_id);
+        self.reservation.insert(id, addr.clone());
+        if self.reservation_peer.insert(peer_id) {
+            self.events.push_back(NetworkBehaviourAction::GenerateEvent(
+                Event::ReservationSelected { peer_id },
+            ));
+        }
     }
 
     fn inject_expired_listen_addr(&mut self, _id: ListenerId, _addr: &Multiaddr) {
