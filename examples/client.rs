@@ -28,7 +28,6 @@ use libp2p::{
 };
 
 use libp2p_autorelay::AutoRelay;
-use log::{error, info};
 
 #[derive(NetworkBehaviour)]
 pub struct Behaviour {
