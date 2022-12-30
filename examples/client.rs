@@ -28,7 +28,7 @@ use libp2p::{
 };
 
 use libp2p_autorelay::AutoRelay;
-use log::{info, error};
+use log::{error, info};
 
 #[derive(NetworkBehaviour)]
 pub struct Behaviour {
@@ -46,6 +46,9 @@ struct Opts {
     /// Fixed value to generate deterministic peer id.
     #[clap(long)]
     secret_key_seed: Option<u8>,
+
+    #[clap(long)]
+    candidates: Vec<Multiaddr>,
 
     /// Enables kademla for getting relays from DHT
     #[clap(long)]
@@ -97,6 +100,29 @@ async fn main() -> anyhow::Result<()> {
         "/ip4/0.0.0.0/udp/0/quic-v1".parse().unwrap(),
     ] {
         swarm.listen_on(addr)?;
+    }
+
+    for addr in opts.candidates {
+        if addr
+            .iter()
+            .any(|proto| matches!(proto, Protocol::P2pCircuit))
+        {
+            continue;
+        }
+
+        if !addr
+            .iter()
+            .last()
+            .map(|proto| matches!(proto, Protocol::P2p(_)))
+            .unwrap_or_default()
+        {
+            continue;
+        }
+
+        let (peer_id, addr) = extract_peer_id_from_multiaddr(addr);
+        let peer_id = peer_id.expect("Require p2p protocol in multiaddr");
+
+        swarm.behaviour_mut().autorelay.add_static_relay(peer_id, addr)?;
     }
 
     if opts.use_kad {
@@ -267,4 +293,21 @@ fn generate_ed25519(secret_key_seed: u8) -> identity::Keypair {
     let secret_key = identity::ed25519::SecretKey::from_bytes(&mut bytes)
         .expect("this returns `Err` only if the length is wrong; the length is correct; qed");
     identity::Keypair::Ed25519(secret_key.into())
+}
+
+#[allow(dead_code)]
+fn peer_id_from_multiaddr(addr: Multiaddr) -> Option<PeerId> {
+    let (peer, _) = extract_peer_id_from_multiaddr(addr);
+    peer
+}
+
+#[allow(dead_code)]
+fn extract_peer_id_from_multiaddr(mut addr: Multiaddr) -> (Option<PeerId>, Multiaddr) {
+    match addr.pop() {
+        Some(Protocol::P2p(hash)) => match PeerId::from_multihash(hash) {
+            Ok(id) => (Some(id), addr),
+            _ => (None, addr),
+        },
+        _ => (None, addr),
+    }
 }
