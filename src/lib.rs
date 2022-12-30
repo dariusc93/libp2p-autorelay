@@ -239,7 +239,9 @@ impl AutoRelay {
     pub fn avg_rtt(&self, peer_id: PeerId) -> Option<u128> {
         let rtts = self.candidates_rtt.get(&peer_id).copied()?;
         let avg: u128 = rtts.iter().map(|duration| duration.as_millis()).sum();
-        let avg = avg / 3_u128;
+        // used in case we cant produce a full avg 
+        let div = rtts.iter().filter(|i| !i.is_zero()).count() as u128;
+        let avg = avg / div;
         Some(avg)
     }
 
