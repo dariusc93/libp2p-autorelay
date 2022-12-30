@@ -41,7 +41,7 @@ pub struct Behaviour {
 }
 
 #[derive(Debug, Parser)]
-#[clap(name = "libp2p DCUtR client")]
+#[clap(name = "libp2p client")]
 struct Opts {
     /// Fixed value to generate deterministic peer id.
     #[clap(long)]
