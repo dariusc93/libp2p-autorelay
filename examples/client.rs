@@ -230,9 +230,13 @@ async fn main() -> anyhow::Result<()> {
                                 info!("Listening on circuit {addr}");
 
                                 if let Err(e) = swarm.listen_on(addr.clone()) {
-                                    error!("Error listening on {addr}: {e}");
+                                    error!("Error listening on {addr}: {}", e.to_string());
                                 }
                             }
+                        }
+                        BehaviourEvent::Autorelay(libp2p_autorelay::Event::ReservationRemoved { peer_id, listener }) => {
+                            println!("{peer_id} was removed");
+                            swarm.remove_listener(listener);
                         }
                         BehaviourEvent::Autorelay(libp2p_autorelay::Event::FindCandidate(tx)) => {
                             if let Some(kad) = swarm.behaviour_mut().kad.as_mut() {

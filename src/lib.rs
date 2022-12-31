@@ -102,6 +102,8 @@ pub struct AutoRelay {
     // Will have a delay start, but will be used to find candidates that might be used
     interval: Interval,
 
+    provider_interval: Option<Interval>,
+
     // Note: In case we should ignore any relays, such as some who have had bad connection,
     //       ping, not reliable in some, or might want to temporarily ignore
     // If the value is `None` the peer will remain blacklisted
@@ -133,6 +135,7 @@ impl Default for AutoRelay {
                 Instant::now() + Duration::from_secs(10),
                 Duration::from_secs(5),
             ),
+            provider_interval: None,
             nat_status: Nat::Unknown,
             limits: Default::default(),
         }
@@ -273,10 +276,10 @@ impl AutoRelay {
 
         self.channel = Some(rx);
 
-        self.interval = Interval::new_at(
+        self.provider_interval = Some(Interval::new_at(
             Instant::now() + Duration::from_secs(1),
             Duration::from_secs(5),
-        );
+        ));
 
         self.events
             .push_back(NetworkBehaviourAction::GenerateEvent(Event::FindCandidate(
@@ -441,7 +444,7 @@ impl AutoRelay {
                 let listeners = self.reservation.remove(&relay_peer_id);
                 self.candidates.remove(&relay_peer_id);
                 self.blacklist.insert(relay_peer_id, None);
-                log::error!("Reservation request failed {relay_peer_id}: {error}");
+                log::error!("Reservation request failed for {relay_peer_id}: {error}");
                 if let Some(listeners) = listeners {
                     for (id, _) in listeners {
                         self.events.push_back(NetworkBehaviourAction::GenerateEvent(
@@ -639,30 +642,48 @@ impl NetworkBehaviour for AutoRelay {
         }
 
         while let Poll::Ready(Some(_)) = self.interval.poll_next_unpin(cx) {
-            let mut channel = std::mem::take(&mut self.channel);
-            let mut closed = false;
-            if let Some(rx) = channel.as_mut() {
-                loop {
-                    match rx.poll_next_unpin(cx) {
-                        Poll::Ready(Some((peer_id, addrs))) => {
-                            self.inject_candidate(peer_id, addrs)
+            self.select_candidate_low_rtt();
+        }
+
+        let mut provider_interval = std::mem::take(&mut self.provider_interval);
+
+        let mut closed = false;
+
+        if let Some(interval) = provider_interval.as_mut() {
+            while let Poll::Ready(Some(_)) = interval.poll_next_unpin(cx) {
+                //TODO: Probably change logic to use `inject_candidate` while polling the swarm
+                //      than sending through a channel
+                let mut channel = std::mem::take(&mut self.channel);
+
+                if let Some(rx) = channel.as_mut() {
+                    loop {
+                        match rx.poll_next_unpin(cx) {
+                            Poll::Ready(Some((peer_id, addrs))) => {
+                                if !self.candidates.contains_key(&peer_id) {
+                                    self.inject_candidate(peer_id, addrs)
+                                }
+                            }
+                            Poll::Ready(None) => {
+                                closed = true;
+                                break;
+                            }
+                            Poll::Pending => break,
                         }
-                        Poll::Ready(None) => {
-                            closed = true;
-                            break;
-                        }
-                        Poll::Pending => break,
+                    }
+                }
+
+                if !closed {
+                    if let Some(rx) = channel {
+                        self.channel = Some(rx);
                     }
                 }
             }
+        }
 
-            if !closed {
-                if let Some(rx) = channel {
-                    self.channel = Some(rx);
-                }
+        if !closed {
+            if let Some(interval) = provider_interval {
+                self.provider_interval = Some(interval);
             }
-
-            self.select_candidate_low_rtt();
         }
 
         Poll::Pending
