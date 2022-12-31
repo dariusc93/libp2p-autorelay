@@ -24,6 +24,7 @@ void = "1.0"
 rand = "0.8"
 
 [dev-dependencies]
+libipld = "0.15"
 libp2p = { version = "0.50", features = ["full"] }
 async-std = { version = "1", features = ["attributes"] }
 clap = { version = "4.0", features = ["derive"] }

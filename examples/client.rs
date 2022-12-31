@@ -1,7 +1,17 @@
-use std::{collections::HashSet, io, str::FromStr, time::Duration};
+use std::{
+    collections::{hash_map::Entry, HashMap, HashSet},
+    io,
+    str::FromStr,
+    time::Duration,
+};
+
+use libipld::{
+    multihash::{Code, MultihashDigest},
+    Cid, IpldCodec,
+};
 
 use clap::Parser;
-use futures::StreamExt;
+use futures::{channel::mpsc::UnboundedSender, StreamExt};
 use libp2p::{
     autonat::Behaviour as Autonat,
     core::{
@@ -13,7 +23,10 @@ use libp2p::{
     dns::{DnsConfig, ResolverConfig},
     identify::{self, Behaviour as Identify, Info},
     identity::{self, Keypair},
-    kad::{store::MemoryStore, Kademlia},
+    kad::{
+        record::Key, store::MemoryStore, GetProvidersOk, Kademlia, KademliaEvent, QueryId,
+        QueryResult,
+    },
     mplex::MplexConfig,
     multiaddr::Protocol,
     noise::{self, NoiseConfig},
@@ -61,6 +74,10 @@ struct Opts {
     /// Random walk
     #[clap(long)]
     random_walk: bool,
+
+    /// Relay Providers
+    #[clap(long)]
+    relay_providers: bool,
 }
 
 #[async_std::main]
@@ -170,11 +187,17 @@ async fn main() -> anyhow::Result<()> {
                 .as_mut()
                 .map(|kad| kad.get_closest_peers(PeerId::random()));
         }
+
+        if opts.relay_providers {
+            swarm.behaviour_mut().autorelay.find_candidates(false);
+        }
     }
 
     let mut relay_timer = wasm_timer::Interval::new(Duration::from_secs(5)).fuse();
 
     let mut addr_filter = HashSet::new();
+    let mut provider_query: HashMap<QueryId, UnboundedSender<(PeerId, Vec<Multiaddr>)>> =
+        HashMap::new();
 
     loop {
         futures::select! {
@@ -211,6 +234,14 @@ async fn main() -> anyhow::Result<()> {
                                 }
                             }
                         }
+                        BehaviourEvent::Autorelay(libp2p_autorelay::Event::FindCandidate(tx)) => {
+                            if let Some(kad) = swarm.behaviour_mut().kad.as_mut() {
+                                let cid = ns_to_cid("/libp2p/relay");
+                                let key = Key::from(cid.hash().to_bytes());
+                                let id = kad.get_providers(key);
+                                provider_query.insert(id, tx);
+                            }
+                        }
                         BehaviourEvent::Identify(identify::Event::Received {
                             peer_id,
                             info:
@@ -243,10 +274,9 @@ async fn main() -> anyhow::Result<()> {
                                 }
                             }
 
-                            if protocols
-                                .iter()
-                                .any(|p| p.as_bytes() == libp2p::relay::v2::HOP_PROTOCOL_NAME)
-                            {
+                            if !opts.relay_providers && protocols
+                                    .iter()
+                                    .any(|p| p.as_bytes() == libp2p::relay::v2::HOP_PROTOCOL_NAME) {
                                 swarm
                                     .behaviour_mut()
                                     .autorelay
@@ -259,7 +289,38 @@ async fn main() -> anyhow::Result<()> {
                         }) => {
                             swarm.behaviour_mut().autorelay.set_candidate_rtt(peer, rtt);
                         },
-                        BehaviourEvent::Kad(_) => {}
+                        BehaviourEvent::Kad(KademliaEvent::OutboundQueryProgressed {
+                            id,
+                            result,
+                            step,
+                            ..
+                        }) => match result {
+                            QueryResult::GetProviders(Ok(GetProvidersOk::FoundProviders {
+                                key: _,
+                                providers,
+                            })) => {
+                                if let Entry::Occupied(entry) =
+                                    provider_query.entry(id)
+                                {
+                                    if !providers.is_empty() {
+                                        let tx = entry.get().clone();
+                                        for provider in providers {
+                                            let _ = tx.unbounded_send((provider, swarm.behaviour_mut().addresses_of_peer(&provider)));
+                                        }
+                                    }
+                                }
+                            }
+                            QueryResult::GetProviders(Ok(
+                                GetProvidersOk::FinishedWithNoAdditionalRecord { .. },
+                            )) => {
+                                if step.last {
+                                    if let Some(tx) = provider_query.remove(&id) {
+                                        tx.close_channel();
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
                         _ => {}
                     },
                     _ => {}
@@ -335,4 +396,13 @@ fn extract_peer_id_from_multiaddr(mut addr: Multiaddr) -> (Option<PeerId>, Multi
         },
         _ => (None, addr),
     }
+}
+
+pub fn ns_to_cid(string: &str) -> Cid {
+    let hash = Code::Sha2_256.digest(string.as_bytes());
+    Cid::new_v1(IpldCodec::Raw.into(), hash)
+}
+
+pub fn cid_to_ns(cid: Cid) -> String {
+    format!("/provider/{cid}")
 }

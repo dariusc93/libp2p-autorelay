@@ -34,7 +34,7 @@ pub enum Event {
         peer_id: PeerId,
         addr: Vec<Multiaddr>,
     },
-    FindCandidate(UnboundedSender<PeerId>),
+    FindCandidate(UnboundedSender<(PeerId, Vec<Multiaddr>)>),
     CandidateLimitReached {
         current: usize,
         limit: usize,
@@ -97,7 +97,7 @@ pub struct AutoRelay {
 
     pending_reservation_peer: HashSet<PeerId>,
 
-    channel: Option<UnboundedReceiver<PeerId>>,
+    channel: Option<UnboundedReceiver<(PeerId, Vec<Multiaddr>)>>,
 
     // Will have a delay start, but will be used to find candidates that might be used
     interval: Interval,
@@ -412,12 +412,19 @@ impl AutoRelay {
             filtered_addrs.push(addr);
         }
 
-        *self.candidates.entry(peer_id).or_default() = filtered_addrs.clone();
-        self.events
-            .push_back(NetworkBehaviourAction::GenerateEvent(Event::Added {
-                peer_id,
-                addr: filtered_addrs,
-            }));
+        match self.candidates.entry(peer_id) {
+            Entry::Vacant(entry) => {
+                entry.insert(filtered_addrs.clone());
+                self.events
+                    .push_back(NetworkBehaviourAction::GenerateEvent(Event::Added {
+                        peer_id,
+                        addr: filtered_addrs,
+                    }));
+            }
+            Entry::Occupied(mut entry) => {
+                *entry.get_mut() = filtered_addrs;
+            }
+        };
     }
 
     //Note: Maybe import the relay behaviour here so we can poll the events ourselves rather than injecting it into this behaviour
@@ -632,6 +639,29 @@ impl NetworkBehaviour for AutoRelay {
         }
 
         while let Poll::Ready(Some(_)) = self.interval.poll_next_unpin(cx) {
+            let mut channel = std::mem::take(&mut self.channel);
+            let mut closed = false;
+            if let Some(rx) = channel.as_mut() {
+                loop {
+                    match rx.poll_next_unpin(cx) {
+                        Poll::Ready(Some((peer_id, addrs))) => {
+                            self.inject_candidate(peer_id, addrs)
+                        }
+                        Poll::Ready(None) => {
+                            closed = true;
+                            break;
+                        }
+                        Poll::Pending => break,
+                    }
+                }
+            }
+
+            if !closed {
+                if let Some(rx) = channel {
+                    self.channel = Some(rx);
+                }
+            }
+
             self.select_candidate_low_rtt();
         }
 
