@@ -27,8 +27,7 @@ pub enum Event {
     },
     ReservationRemoved {
         peer_id: PeerId,
-        listener: ListenerId,
-    },
+     },
     Added {
         peer_id: PeerId,
         addr: Vec<Multiaddr>,
