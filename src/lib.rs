@@ -49,19 +49,15 @@ type NetworkBehaviourAction = swarm::NetworkBehaviourAction<Event, DummyConnecti
 
 #[derive(Debug, Copy, Clone)]
 pub struct RelayLimits {
-    pub min_candidates: usize,
     pub max_candidates: usize,
-    pub min_reservation: usize,
     pub max_reservation: usize,
 }
 
 impl Default for RelayLimits {
     fn default() -> Self {
         Self {
-            min_candidates: 1,
             max_candidates: 20,
-            min_reservation: 1,
-            max_reservation: 2,
+            max_reservation: 1,
         }
     }
 }
@@ -220,18 +216,11 @@ impl AutoRelay {
     }
 
     pub fn in_candidate_threshold(&self) -> bool {
-        self.candidates.len() >= self.limits.min_candidates
-            && self.candidates.len() <= self.limits.max_candidates
-    }
-
-    pub fn out_of_candidate_threshold(&self) -> bool {
-        self.candidates.len() < self.limits.min_candidates
-            || self.candidates.len() > self.limits.max_candidates
+        !self.candidates.is_empty() && self.candidates.len() <= self.limits.max_candidates
     }
 
     pub fn in_reservation_threshold(&self) -> bool {
-        self.reservation.len() >= self.limits.min_reservation
-            && self.reservation.len() <= self.limits.max_reservation
+        !self.reservation.is_empty() && self.reservation.len() <= self.limits.max_reservation
     }
 
     pub fn avg_rtt(&self, peer_id: PeerId) -> Option<u128> {
@@ -292,8 +281,8 @@ impl AutoRelay {
     //      rather than relying on low rtt but it might be better this
     //      way
     pub fn select_candidate_low_rtt(&mut self) {
-        if self.candidates.len() < self.limits.min_candidates {
-            warn!("Candidates are below threshold");
+        if self.candidates.is_empty() {
+            warn!("No candidates available");
             return;
         }
 
@@ -347,8 +336,8 @@ impl AutoRelay {
     }
 
     pub fn select_candidate_random(&mut self) {
-        if self.candidates.len() < self.limits.min_candidates {
-            warn!("Candidates are below threshold");
+        if self.candidates.is_empty() {
+            warn!("No candidates available");
             return;
         }
 
