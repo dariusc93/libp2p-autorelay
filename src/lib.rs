@@ -642,7 +642,9 @@ impl NetworkBehaviour for AutoRelay {
         }
 
         while let Poll::Ready(Some(_)) = self.interval.poll_next_unpin(cx) {
-            self.select_candidate_low_rtt();
+            if self.in_candidate_threshold() && !self.in_reservation_threshold() {
+                self.select_candidate_low_rtt();
+            }
         }
 
         let mut provider_interval = std::mem::take(&mut self.provider_interval);
