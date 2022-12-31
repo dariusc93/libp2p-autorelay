@@ -1,4 +1,4 @@
-use std::{io, str::FromStr, time::Duration};
+use std::{collections::HashSet, io, str::FromStr, time::Duration};
 
 use clap::Parser;
 use futures::StreamExt;
@@ -174,6 +174,8 @@ async fn main() -> anyhow::Result<()> {
 
     let mut relay_timer = wasm_timer::Interval::new(Duration::from_secs(5)).fuse();
 
+    let mut addr_filter = HashSet::new();
+
     loop {
         futures::select! {
             _ = relay_timer.next() => {
@@ -186,7 +188,9 @@ async fn main() -> anyhow::Result<()> {
                 match event {
                     SwarmEvent::NewListenAddr { address, .. } => {
                         //Note: Multiple addresses are shown when listening due to the dial concurrency factor
-                        println!("Listening on {address}");
+                        if addr_filter.insert(address.clone()) {
+                            println!("Listening on {address}");
+                        }
                     }
                     SwarmEvent::Behaviour(event) => match event {
                         BehaviourEvent::RelayClient(event) => {

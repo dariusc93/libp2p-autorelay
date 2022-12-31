@@ -163,8 +163,8 @@ impl AutoRelay {
         }
 
         info!("Attempting to add {peer_id} as a static relay");
-        //TODO: If address contains a dns, maybe we should resolve it?
 
+        //TODO: If address contains a dns, maybe we should resolve it?
         if let Entry::Occupied(entry) = self.pending_candidates.entry(peer_id) {
             if entry.get().contains(&addr) {
                 anyhow::bail!("Address is already pending");
