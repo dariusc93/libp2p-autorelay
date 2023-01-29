@@ -229,8 +229,9 @@ async fn main() -> anyhow::Result<()> {
 
                                 info!("Listening on circuit {addr}");
 
-                                if let Err(e) = swarm.listen_on(addr.clone()) {
-                                    error!("Error listening on {addr}: {}", e.to_string());
+                                match swarm.listen_on(addr.clone()) {
+                                    Ok(id) => swarm.behaviour_mut().autorelay.inject_listener_id(id, addr),
+                                    Err(e) => error!("Error listening on {addr}: {}", e.to_string())
                                 }
                             }
                         }

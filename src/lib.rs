@@ -93,6 +93,8 @@ pub struct AutoRelay {
 
     pending_reservation_peer: HashSet<PeerId>,
 
+    pending_reservation_id: HashMap<ListenerId, Vec<Multiaddr>>,
+
     channel: Option<UnboundedReceiver<(PeerId, Vec<Multiaddr>)>>,
 
     // Will have a delay start, but will be used to find candidates that might be used
@@ -126,6 +128,7 @@ impl Default for AutoRelay {
             channel: None,
             reservation: Default::default(),
             pending_reservation_peer: Default::default(),
+            pending_reservation_id: Default::default(),
             blacklist: Default::default(),
             interval: Interval::new_at(
                 Instant::now() + Duration::from_secs(10),
@@ -231,6 +234,8 @@ impl AutoRelay {
         let avg = avg / div;
         Some(avg)
     }
+
+    pub fn flush(&mut self) {}
 
     #[allow(dead_code)]
     //TODO: Maybe ignore for now?
@@ -372,6 +377,13 @@ impl AutoRelay {
                 })
                 .or_insert([Duration::from_millis(0), Duration::from_millis(0), rtt]);
         }
+    }
+
+    pub fn inject_listener_id(&mut self, id: ListenerId, addr: Multiaddr) {
+        self.pending_reservation_id
+            .entry(id)
+            .or_default()
+            .push(addr)
     }
 
     pub fn inject_candidate(&mut self, peer_id: PeerId, addrs: Vec<Multiaddr>) {
@@ -531,58 +543,70 @@ impl NetworkBehaviour for AutoRelay {
     fn inject_event(&mut self, _peer_id: PeerId, _connection: ConnectionId, _event: void::Void) {}
 
     fn inject_new_listen_addr(&mut self, id: ListenerId, addr: &Multiaddr) {
-        if !addr
-            .iter()
-            .any(|proto| matches!(proto, Protocol::P2pCircuit | Protocol::P2p(_)))
-        {
-            // We want to make sure that we only collect addresses that contained p2p and p2p-circuit protocols
-            return;
-        }
-
-        let mut addr = addr.clone();
-
-        //not sure if we want to store the p2p protocol but for now strip it out
-        let Some(Protocol::P2p(_)) = addr.pop() else {
-            return;
-        };
-
-        let Some(Protocol::P2pCircuit) = addr.pop() else {
-            return;
-        };
-
-        let Some(peer_id) = peer_id_from_multiaddr(addr.clone()) else {
-            return;
-        };
-
-        if let Some(listeners) = self.reservation.get(&peer_id) {
-            if listeners.contains_key(&id) {
+        if let Entry::Occupied(entry) = self.pending_reservation_id.entry(id) {
+            //TODO: Compare address against pending reservation
+            if !addr
+                .iter()
+                .any(|proto| matches!(proto, Protocol::P2pCircuit | Protocol::P2p(_)))
+            {
+                // We want to make sure that we only collect addresses that contained p2p and p2p-circuit protocols
                 return;
             }
+
+            let mut addr = addr.clone();
+
+            //not sure if we want to store the p2p protocol but for now strip it out
+            let Some(Protocol::P2p(_)) = addr.pop() else {
+                return;
+            };
+
+            let Some(Protocol::P2pCircuit) = addr.pop() else {
+                return;
+            };
+
+            let Some(peer_id) = peer_id_from_multiaddr(addr.clone()) else {
+                return;
+            };
+
+            if let Some(listeners) = self.reservation.get(&peer_id) {
+                if listeners.contains_key(&id) {
+                    return;
+                }
+            }
+
+            self.pending_reservation_peer.remove(&peer_id);
+
+            match self.reservation.entry(peer_id) {
+                Entry::Occupied(mut entry) => {
+                    entry.get_mut().insert(id, addr.clone());
+                }
+                Entry::Vacant(entry) => {
+                    let mut listeners = HashMap::new();
+                    listeners.insert(id, addr.clone());
+                    entry.insert(listeners);
+                }
+            };
+            entry.remove();
         }
-
-        self.pending_reservation_peer.remove(&peer_id);
-
-        match self.reservation.entry(peer_id) {
-            Entry::Occupied(mut entry) => {
-                entry.get_mut().insert(id, addr.clone());
-            }
-            Entry::Vacant(entry) => {
-                let mut listeners = HashMap::new();
-                listeners.insert(id, addr.clone());
-                entry.insert(listeners);
-            }
-        };
     }
 
-    fn inject_expired_listen_addr(&mut self, _id: ListenerId, _addr: &Multiaddr) {
-        //TODO
+    fn inject_expired_listen_addr(&mut self, id: ListenerId, _addr: &Multiaddr) {
+        if let Entry::Occupied(entry) = self.pending_reservation_id.entry(id) {
+            entry.remove();
+        }
     }
 
-    fn inject_listener_closed(&mut self, _id: ListenerId, _reason: Result<(), &std::io::Error>) {
-        //TODO
+    fn inject_listener_closed(&mut self, id: ListenerId, _reason: Result<(), &std::io::Error>) {
+        if let Entry::Occupied(entry) = self.pending_reservation_id.entry(id) {
+            entry.remove();
+        }
     }
 
-    fn inject_listener_error(&mut self, _id: ListenerId, _: &(dyn std::error::Error + 'static)) {}
+    fn inject_listener_error(&mut self, id: ListenerId, _: &(dyn std::error::Error + 'static)) {
+        if let Entry::Occupied(entry) = self.pending_reservation_id.entry(id) {
+            entry.remove();
+        }
+    }
 
     fn inject_dial_failure(
         &mut self,
