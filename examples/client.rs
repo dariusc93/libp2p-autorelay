@@ -11,9 +11,9 @@ use libipld::{
 };
 
 use clap::Parser;
-use futures::{channel::mpsc::UnboundedSender, StreamExt, future::Either};
+use futures::{channel::mpsc::UnboundedSender, future::Either, StreamExt};
 use libp2p::{
-    autonat::{self, Behaviour as Autonat, NatStatus},
+    autonat::Behaviour as Autonat,
     core::{
         muxing::StreamMuxerBox,
         transport::{timeout::TransportTimeout, Boxed, OrTransport},
@@ -32,14 +32,14 @@ use libp2p::{
     ping::{self, Behaviour as Ping},
     quic::async_std::Transport as AsyncQuicTransport,
     quic::Config as QuicConfig,
-    relay::client::{Transport as ClientTransport, Behaviour as RelayClient},
+    relay::client::{Behaviour as RelayClient, Transport as ClientTransport},
     swarm::{behaviour::toggle::Toggle, NetworkBehaviour, SwarmBuilder, SwarmEvent},
     tcp::{async_io::Transport as AsyncTcpTransport, Config as GenTcpConfig},
     yamux::YamuxConfig,
     Multiaddr, PeerId, Transport,
 };
 
-use libp2p_autorelay::{AutoRelay, Nat};
+use libp2p_autorelay::AutoRelay;
 use log::{error, info};
 
 #[derive(NetworkBehaviour)]
@@ -244,7 +244,7 @@ async fn main() -> anyhow::Result<()> {
                             println!("{peer_id} was removed");
                             swarm.remove_listener(listener);
                         }
-                        BehaviourEvent::Autorelay(libp2p_autorelay::Event::FindCandidate(tx)) => {
+                        BehaviourEvent::Autorelay(libp2p_autorelay::Event::FindProviders(tx)) => {
                             if let Some(kad) = swarm.behaviour_mut().kad.as_mut() {
                                 let cid = ns_to_cid("/libp2p/relay");
                                 let key = Key::from(cid.hash().to_bytes());
@@ -286,7 +286,7 @@ async fn main() -> anyhow::Result<()> {
 
                             if !opts.relay_providers && protocols
                                     .iter()
-                                    .any(|p| p.as_bytes() == libp2p::relay::v2::HOP_PROTOCOL_NAME) {
+                                    .any(|p| p.as_bytes() == libp2p::relay::HOP_PROTOCOL_NAME) {
                                 swarm
                                     .behaviour_mut()
                                     .autorelay
@@ -365,7 +365,7 @@ pub async fn build_transport(
     .await?;
 
     let transport = OrTransport::new(relay, transport)
-        .upgrade(Version::V1)
+        .upgrade(Version::V1Lazy)
         .authenticate(noise_config)
         .multiplex(multiplex_upgrade)
         .timeout(Duration::from_secs(30))
