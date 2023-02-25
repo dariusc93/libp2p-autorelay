@@ -1,11 +1,10 @@
 use std::{io, time::Duration};
 
 use clap::Parser;
-use futures::StreamExt;
+use futures::{StreamExt, future::Either};
 use libp2p::{
     autonat::Behaviour as Autonat,
     core::{
-        either::EitherOutput,
         muxing::StreamMuxerBox,
         transport::{timeout::TransportTimeout, Boxed, OrTransport},
         upgrade::{SelectUpgrade, Version},
@@ -18,7 +17,7 @@ use libp2p::{
     ping::Behaviour as Ping,
     quic::async_std::Transport as AsyncQuicTransport,
     quic::Config as QuicConfig,
-    relay::v2::relay::Relay,
+    relay::Behaviour as Relay,
     swarm::{NetworkBehaviour, SwarmBuilder, SwarmEvent},
     tcp::{async_io::Transport as AsyncTcpTransport, Config as GenTcpConfig},
     yamux::YamuxConfig,
@@ -154,8 +153,8 @@ pub fn build_transport(keypair: Keypair) -> io::Result<Boxed<(PeerId, StreamMuxe
 
     let transport = OrTransport::new(quic_transport, transport)
         .map(|either_output, _| match either_output {
-            EitherOutput::First((peer_id, muxer)) => (peer_id, StreamMuxerBox::new(muxer)),
-            EitherOutput::Second((peer_id, muxer)) => (peer_id, StreamMuxerBox::new(muxer)),
+            Either::Left((peer_id, muxer)) => (peer_id, StreamMuxerBox::new(muxer)),
+            Either::Right((peer_id, muxer)) => (peer_id, StreamMuxerBox::new(muxer)),
         })
         .boxed();
 

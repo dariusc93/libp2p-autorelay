@@ -12,7 +12,7 @@ exclude = [".gitignore"]
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-libp2p = { version = "0.50", features = ["relay"] }
+libp2p = { version = "0.51", features = ["relay"] }
 # TODO: Use Cid and Multihash directly
 # libipld = "0.15"
 thiserror = "1.0"
@@ -25,7 +25,8 @@ rand = "0.8"
 
 [dev-dependencies]
 libipld = "0.15"
-libp2p = { version = "0.50", features = ["full"] }
+libp2p = { version = "0.51", features = ["full"] }
 async-std = { version = "1", features = ["attributes"] }
 clap = { version = "4.0", features = ["derive"] }
 env_logger = "0.10"
+libp2p-nat = { version = "0.2", default-features = false, features = ["async-std"] }

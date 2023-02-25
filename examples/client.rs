@@ -11,11 +11,10 @@ use libipld::{
 };
 
 use clap::Parser;
-use futures::{channel::mpsc::UnboundedSender, StreamExt};
+use futures::{channel::mpsc::UnboundedSender, StreamExt, future::Either};
 use libp2p::{
-    autonat::Behaviour as Autonat,
+    autonat::{self, Behaviour as Autonat, NatStatus},
     core::{
-        either::EitherOutput,
         muxing::StreamMuxerBox,
         transport::{timeout::TransportTimeout, Boxed, OrTransport},
         upgrade::{SelectUpgrade, Version},
@@ -33,14 +32,14 @@ use libp2p::{
     ping::{self, Behaviour as Ping},
     quic::async_std::Transport as AsyncQuicTransport,
     quic::Config as QuicConfig,
-    relay::v2::client::{transport::ClientTransport, Client as RelayClient},
+    relay::client::{Transport as ClientTransport, Behaviour as RelayClient},
     swarm::{behaviour::toggle::Toggle, NetworkBehaviour, SwarmBuilder, SwarmEvent},
     tcp::{async_io::Transport as AsyncTcpTransport, Config as GenTcpConfig},
     yamux::YamuxConfig,
     Multiaddr, PeerId, Transport,
 };
 
-use libp2p_autorelay::AutoRelay;
+use libp2p_autorelay::{AutoRelay, Nat};
 use log::{error, info};
 
 #[derive(NetworkBehaviour)]
@@ -50,6 +49,7 @@ pub struct Behaviour {
     autonat: Autonat,
     identify: Identify,
     ping: Ping,
+    upnp: Toggle<libp2p_nat::Behaviour>,
     kad: Toggle<Kademlia<MemoryStore>>,
 }
 
@@ -78,9 +78,13 @@ struct Opts {
     /// Relay Providers
     #[clap(long)]
     relay_providers: bool,
+
+    #[clap(long)]
+    upnp: bool,
 }
 
 #[async_std::main]
+#[allow(deprecated)]
 async fn main() -> anyhow::Result<()> {
     env_logger::init();
 
@@ -97,7 +101,7 @@ async fn main() -> anyhow::Result<()> {
 
     let (relay_transport, relay_client) = RelayClient::new_transport_and_behaviour(local_peer_id);
 
-    let transport = build_transport(local_keypair.clone(), relay_transport)?;
+    let transport = build_transport(local_keypair.clone(), relay_transport).await?;
 
     let behaviour = Behaviour {
         autonat: Autonat::new(local_peer_id, Default::default()),
@@ -108,6 +112,7 @@ async fn main() -> anyhow::Result<()> {
             config.push_listen_addr_updates = true;
             config
         }),
+        upnp: Toggle::from((opts.upnp).then_some(libp2p_nat::Behaviour::new().await?)),
         relay_client,
         autorelay: AutoRelay::default(),
         kad: Toggle::from((!opts.disable_kad).then_some({
@@ -335,7 +340,7 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-pub fn build_transport(
+pub async fn build_transport(
     keypair: Keypair,
     relay: ClientTransport,
 ) -> io::Result<Boxed<(PeerId, StreamMuxerBox)>> {
@@ -352,11 +357,12 @@ pub fn build_transport(
 
     let transport_timeout = TransportTimeout::new(transport, Duration::from_secs(30));
 
-    let transport = futures::executor::block_on(DnsConfig::custom(
+    let transport = DnsConfig::custom(
         transport_timeout,
         ResolverConfig::cloudflare(),
         Default::default(),
-    ))?;
+    )
+    .await?;
 
     let transport = OrTransport::new(relay, transport)
         .upgrade(Version::V1)
@@ -369,8 +375,8 @@ pub fn build_transport(
 
     let transport = OrTransport::new(quic_transport, transport)
         .map(|either_output, _| match either_output {
-            EitherOutput::First((peer_id, muxer)) => (peer_id, StreamMuxerBox::new(muxer)),
-            EitherOutput::Second((peer_id, muxer)) => (peer_id, StreamMuxerBox::new(muxer)),
+            Either::Left((peer_id, muxer)) => (peer_id, StreamMuxerBox::new(muxer)),
+            Either::Right((peer_id, muxer)) => (peer_id, StreamMuxerBox::new(muxer)),
         })
         .boxed();
 
