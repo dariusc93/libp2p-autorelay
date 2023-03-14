@@ -5,7 +5,8 @@ use futures::channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
 use futures::StreamExt;
 use libp2p::core::transport::ListenerId;
 use libp2p::core::Endpoint;
-use libp2p::core::{ConnectedPoint, Multiaddr, PeerId};
+use libp2p::core::{ConnectedPoint, Multiaddr};
+use libp2p::identity::PeerId;
 use libp2p::multiaddr::Protocol;
 use libp2p::relay::client::Event as RelayClientEvent;
 use libp2p::swarm::derive_prelude::ConnectionEstablished;
@@ -612,11 +613,7 @@ impl NetworkBehaviour for AutoRelay {
                     }
                 }
             }
-            swarm::FromSwarm::DialFailure(DialFailure {
-                peer_id,
-                error,
-                ..
-            }) => {
+            swarm::FromSwarm::DialFailure(DialFailure { peer_id, error, .. }) => {
                 if let Some(peer_id) = peer_id {
                     if let Entry::Occupied(mut entry) = self.pending_candidates.entry(peer_id) {
                         let addresses = entry.get_mut();
