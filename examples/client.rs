@@ -1,5 +1,5 @@
 use std::{
-    collections::{hash_map::Entry, HashMap, HashSet},
+    collections::{HashMap, HashSet},
     io,
     str::FromStr,
     time::Duration,
@@ -17,7 +17,7 @@ use libp2p::{
     core::{
         muxing::StreamMuxerBox,
         transport::{timeout::TransportTimeout, Boxed, OrTransport},
-        upgrade::{SelectUpgrade, Version},
+        upgrade::Version,
     },
     dns::{DnsConfig, ResolverConfig},
     identify::{self, Behaviour as Identify, Info},
@@ -26,21 +26,18 @@ use libp2p::{
         record::Key, store::MemoryStore, GetProvidersOk, Kademlia, KademliaEvent, QueryId,
         QueryResult,
     },
-    mplex::MplexConfig,
     multiaddr::Protocol,
-    noise::{self, NoiseConfig},
+    noise,
     ping::{self, Behaviour as Ping},
-    quic::async_std::Transport as AsyncQuicTransport,
-    quic::Config as QuicConfig,
     relay::client::{Behaviour as RelayClient, Transport as ClientTransport},
     swarm::{behaviour::toggle::Toggle, NetworkBehaviour, SwarmBuilder, SwarmEvent},
     tcp::{async_io::Transport as AsyncTcpTransport, Config as GenTcpConfig},
-    yamux::YamuxConfig,
     Multiaddr, PeerId, Transport,
 };
 
-use libp2p_autorelay::AutoRelay;
-use log::{error, info};
+use libp2p_quic::{async_std::Transport as AsyncQuicTransport, Config as QuicConfig};
+
+use libp2p_autorelay::Behaviour as AutoRelay;
 
 #[derive(NetworkBehaviour)]
 pub struct Behaviour {
@@ -49,7 +46,6 @@ pub struct Behaviour {
     autonat: Autonat,
     identify: Identify,
     ping: Ping,
-    upnp: Toggle<libp2p_nat::Behaviour>,
     kad: Toggle<Kademlia<MemoryStore>>,
 }
 
@@ -78,9 +74,6 @@ struct Opts {
     /// Relay Providers
     #[clap(long)]
     relay_providers: bool,
-
-    #[clap(long)]
-    upnp: bool,
 }
 
 #[async_std::main]
@@ -99,9 +92,9 @@ async fn main() -> anyhow::Result<()> {
 
     println!("Local Node: {local_peer_id}");
 
-    let (relay_transport, relay_client) = RelayClient::new_transport_and_behaviour(local_peer_id);
+    let (relay_transport, relay_client) = libp2p::relay::client::new(local_peer_id);
 
-    let transport = build_transport(local_keypair.clone(), relay_transport).await?;
+    let transport = build_transport(local_keypair.clone(), relay_transport)?;
 
     let behaviour = Behaviour {
         autonat: Autonat::new(local_peer_id, Default::default()),
@@ -112,7 +105,7 @@ async fn main() -> anyhow::Result<()> {
             config.push_listen_addr_updates = true;
             config
         }),
-        upnp: Toggle::from((opts.upnp).then_some(libp2p_nat::Behaviour::new().await?)),
+        // upnp: Toggle::from((opts.upnp).then_some(libp2p_nat::Behaviour::new().await?)),
         relay_client,
         autorelay: AutoRelay::default(),
         kad: Toggle::from((!opts.disable_kad).then_some({
@@ -210,6 +203,12 @@ async fn main() -> anyhow::Result<()> {
                 let autorelay = &mut swarm.behaviour_mut().autorelay;
                 if autorelay.in_candidate_threshold() && !autorelay.in_reservation_threshold() {
                     autorelay.select_candidate_low_rtt();
+                } else {
+                    for reservation in autorelay.list_reservation() {
+                        for addr in &reservation.addr {
+                            println!("{}", addr.clone().with(Protocol::P2p(reservation.peer_id)));
+                        }
+                    }
                 }
             }
             event = swarm.select_next_some() => {
@@ -224,25 +223,6 @@ async fn main() -> anyhow::Result<()> {
                         BehaviourEvent::RelayClient(event) => {
                             log::debug!("{event:?}");
                             swarm.behaviour_mut().autorelay.inject_relay_client_event(event);
-                        }
-                        BehaviourEvent::Autorelay(libp2p_autorelay::Event::ReservationSelected { peer_id, addrs }) => {
-                            println!("{peer_id} was selected");
-                            for addr in addrs {
-                                let addr = addr
-                                    .with(Protocol::P2p(peer_id.into()))
-                                    .with(Protocol::P2pCircuit);
-
-                                info!("Listening on circuit {addr}");
-
-                                match swarm.listen_on(addr.clone()) {
-                                    Ok(id) => swarm.behaviour_mut().autorelay.inject_listener_id(id, addr),
-                                    Err(e) => error!("Error listening on {addr}: {}", e.to_string())
-                                }
-                            }
-                        }
-                        BehaviourEvent::Autorelay(libp2p_autorelay::Event::ReservationRemoved { peer_id, listener }) => {
-                            println!("{peer_id} was removed");
-                            swarm.remove_listener(listener);
                         }
                         BehaviourEvent::Autorelay(libp2p_autorelay::Event::FindProviders(tx)) => {
                             if let Some(kad) = swarm.behaviour_mut().kad.as_mut() {
@@ -261,32 +241,9 @@ async fn main() -> anyhow::Result<()> {
                                     ..
                                 },
                         }) => {
-                            if protocols
-                                .iter()
-                                .any(|p| p.as_bytes() == libp2p::kad::protocol::DEFAULT_PROTO_NAME)
-                            {
-                                if let Some(kad) = swarm.behaviour_mut().kad.as_mut() {
-                                    for addr in &listen_addrs {
-                                        kad.add_address(&peer_id, addr.clone());
-                                    }
-                                }
-                            }
-
-                            if protocols
-                                .iter()
-                                .any(|p| p.as_bytes() == libp2p::autonat::DEFAULT_PROTOCOL_NAME)
-                            {
-                                for addr in listen_addrs.clone() {
-                                    swarm
-                                        .behaviour_mut()
-                                        .autonat
-                                        .add_server(peer_id, Some(addr));
-                                }
-                            }
-
                             if !opts.relay_providers && protocols
                                     .iter()
-                                    .any(|p| p.as_bytes() == libp2p::relay::HOP_PROTOCOL_NAME) {
+                                    .any(|p| libp2p::relay::HOP_PROTOCOL_NAME.eq(p)) {
                                 swarm
                                     .behaviour_mut()
                                     .autorelay
@@ -295,7 +252,8 @@ async fn main() -> anyhow::Result<()> {
                         }
                         BehaviourEvent::Ping(ping::Event {
                             peer,
-                            result: Result::Ok(ping::Success::Ping { rtt }),
+                            result: Result::Ok(rtt),
+                            ..
                         }) => {
                             swarm.behaviour_mut().autorelay.set_candidate_rtt(peer, rtt);
                         },
@@ -307,18 +265,18 @@ async fn main() -> anyhow::Result<()> {
                         }) => match result {
                             QueryResult::GetProviders(Ok(GetProvidersOk::FoundProviders {
                                 key: _,
-                                providers,
+                                providers: _,
                             })) => {
-                                if let Entry::Occupied(entry) =
-                                    provider_query.entry(id)
-                                {
-                                    if !providers.is_empty() {
-                                        let tx = entry.get().clone();
-                                        for provider in providers {
-                                            let _ = tx.unbounded_send((provider, swarm.behaviour_mut().addresses_of_peer(&provider)));
-                                        }
-                                    }
-                                }
+                                // if let Entry::Occupied(entry) =
+                                //     provider_query.entry(id)
+                                // {
+                                //     // if !providers.is_empty() {
+                                //     //     let tx = entry.get().clone();
+                                //     //     for provider in providers {
+                                //     //         let _ = tx.unbounded_send((provider, swarm.behaviour_mut()));
+                                //     //     }
+                                //     // }
+                                // }
                             }
                             QueryResult::GetProviders(Ok(
                                 GetProvidersOk::FinishedWithNoAdditionalRecord { .. },
@@ -340,16 +298,13 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-pub async fn build_transport(
+pub fn build_transport(
     keypair: Keypair,
     relay: ClientTransport,
 ) -> io::Result<Boxed<(PeerId, StreamMuxerBox)>> {
-    let xx_keypair = noise::Keypair::<noise::X25519Spec>::new()
-        .into_authentic(&keypair)
-        .unwrap();
-    let noise_config = NoiseConfig::xx(xx_keypair).into_authenticated();
+    let noise_config = noise::Config::new(&keypair).unwrap();
 
-    let multiplex_upgrade = SelectUpgrade::new(YamuxConfig::default(), MplexConfig::new());
+    let multiplex_upgrade = libp2p::yamux::Config::default();
 
     let quic_transport = AsyncQuicTransport::new(QuicConfig::new(&keypair));
 
@@ -357,15 +312,14 @@ pub async fn build_transport(
 
     let transport_timeout = TransportTimeout::new(transport, Duration::from_secs(30));
 
-    let transport = DnsConfig::custom(
+    let transport = futures::executor::block_on(DnsConfig::custom(
         transport_timeout,
         ResolverConfig::cloudflare(),
         Default::default(),
-    )
-    .await?;
+    ))?;
 
     let transport = OrTransport::new(relay, transport)
-        .upgrade(Version::V1Lazy)
+        .upgrade(Version::V1)
         .authenticate(noise_config)
         .multiplex(multiplex_upgrade)
         .timeout(Duration::from_secs(30))
@@ -382,7 +336,6 @@ pub async fn build_transport(
 
     Ok(transport)
 }
-
 fn generate_ed25519(secret_key_seed: u8) -> identity::Keypair {
     let mut bytes = [0u8; 32];
     bytes[0] = secret_key_seed;
@@ -398,10 +351,7 @@ fn peer_id_from_multiaddr(addr: Multiaddr) -> Option<PeerId> {
 #[allow(dead_code)]
 fn extract_peer_id_from_multiaddr(mut addr: Multiaddr) -> (Option<PeerId>, Multiaddr) {
     match addr.pop() {
-        Some(Protocol::P2p(hash)) => match PeerId::from_multihash(hash) {
-            Ok(id) => (Some(id), addr),
-            _ => (None, addr),
-        },
+        Some(Protocol::P2p(id)) => (Some(id), addr),
         _ => (None, addr),
     }
 }

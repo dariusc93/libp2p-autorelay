@@ -5,19 +5,18 @@ use futures::channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
 use futures::StreamExt;
 use libp2p::core::transport::ListenerId;
 use libp2p::core::Endpoint;
-use libp2p::core::{ConnectedPoint, Multiaddr};
+use libp2p::core::Multiaddr;
 use libp2p::identity::PeerId;
 use libp2p::multiaddr::Protocol;
 use libp2p::relay::client::Event as RelayClientEvent;
-use libp2p::swarm::derive_prelude::ConnectionEstablished;
-use libp2p::swarm::dial_opts::DialOpts;
+use libp2p::swarm::derive_prelude::NewListener;
+use libp2p::swarm::dial_opts::{DialOpts, PeerCondition};
 use libp2p::swarm::{
-    self, dummy::ConnectionHandler as DummyConnectionHandler, DialError, NetworkBehaviour,
-    PollParameters,
+    self, dummy::ConnectionHandler as DummyConnectionHandler, PollParameters, ToSwarm,
 };
 use libp2p::swarm::{
-    ConnectionClosed, ConnectionDenied, ConnectionId, DialFailure, ExpiredListenAddr,
-    ListenerClosed, ListenerError, NewListenAddr, THandler, THandlerInEvent,
+    ConnectionClosed, ConnectionDenied, ConnectionId, DialFailure, ExpiredListenAddr, ListenOpts,
+    ListenerClosed, ListenerError, NetworkBehaviour, NewListenAddr, THandler, THandlerInEvent,
 };
 use log::{info, trace, warn};
 use rand::seq::SliceRandom;
@@ -29,23 +28,9 @@ use wasm_timer::{Instant, Interval};
 
 #[derive(Debug, Clone)]
 pub enum Event {
-    ReservationSelected {
-        peer_id: PeerId,
-        addrs: Vec<Multiaddr>,
-    },
-    ReservationRemoved {
-        peer_id: PeerId,
-        listener: ListenerId,
-    },
-    Added {
-        peer_id: PeerId,
-        addr: Vec<Multiaddr>,
-    },
     FindCandidates,
     FindProviders(UnboundedSender<(PeerId, Vec<Multiaddr>)>),
 }
-
-type NetworkBehaviourAction = swarm::NetworkBehaviourAction<Event, THandlerInEvent<AutoRelay>>;
 
 #[derive(Debug, Copy, Clone)]
 pub struct RelayLimits {
@@ -73,13 +58,19 @@ pub enum Nat {
     Unknown,
 }
 
+#[derive(Debug, Clone)]
+pub struct Reservsation {
+    pub peer_id: PeerId,
+    pub addr: Vec<Multiaddr>,
+}
+
 #[allow(dead_code)]
 //Note: `candidates_without_addr` is not in use but is meant to be used for fetching from
 //      kad providers (or just sending peers through channels that will be used as a relay)
-pub struct AutoRelay {
-    events: VecDeque<NetworkBehaviourAction>,
+pub struct Behaviour {
+    events: VecDeque<ToSwarm<<Self as NetworkBehaviour>::ToSwarm, THandlerInEvent<Self>>>,
 
-    pending_candidates: HashMap<PeerId, Vec<Multiaddr>>,
+    pending_candidates: HashMap<PeerId, Vec<ConnectionId>>,
 
     candidates_without_addr: HashSet<PeerId>,
 
@@ -89,13 +80,9 @@ pub struct AutoRelay {
 
     candidates_connection: HashMap<ConnectionId, Multiaddr>,
 
-    reservation: HashMap<PeerId, HashMap<ListenerId, Multiaddr>>,
+    reservations: HashMap<ListenerId, Reservsation>,
 
-    reservation_id: HashMap<ListenerId, Vec<Multiaddr>>,
-
-    pending_reservation_peer: HashSet<PeerId>,
-
-    pending_reservation_id: HashSet<ListenerId>,
+    pending_reservation: HashMap<PeerId, ListenerId>,
 
     channel: Option<UnboundedReceiver<(PeerId, Vec<Multiaddr>)>>,
 
@@ -119,7 +106,7 @@ pub struct AutoRelay {
     limits: RelayLimits,
 }
 
-impl Default for AutoRelay {
+impl Default for Behaviour {
     fn default() -> Self {
         Self {
             events: Default::default(),
@@ -129,10 +116,8 @@ impl Default for AutoRelay {
             candidates_rtt: Default::default(),
             candidates_connection: Default::default(),
             channel: None,
-            reservation: Default::default(),
-            pending_reservation_peer: Default::default(),
-            pending_reservation_id: Default::default(),
-            reservation_id: Default::default(),
+            reservations: Default::default(),
+            pending_reservation: Default::default(),
             blacklist: Default::default(),
             interval: Interval::new_at(
                 Instant::now() + Duration::from_secs(10),
@@ -146,21 +131,13 @@ impl Default for AutoRelay {
     }
 }
 
-impl AutoRelay {
+impl Behaviour {
     pub fn limits(&self) -> RelayLimits {
         self.limits
     }
 
     pub fn candidates_amount(&self) -> usize {
         self.candidates.len()
-    }
-
-    pub fn reservation_amount(&self) -> usize {
-        self.reservation.len()
-    }
-
-    pub fn reservation_list(&self) -> Vec<PeerId> {
-        self.reservation.keys().copied().collect()
     }
 
     pub fn nat_status(&mut self) -> Nat {
@@ -183,33 +160,25 @@ impl AutoRelay {
 
         info!("Attempting to add {peer_id} as a static relay");
 
-        //TODO: If address contains a dns, maybe we should resolve it?
-        if let Entry::Occupied(entry) = self.pending_candidates.entry(peer_id) {
-            if entry.get().contains(&addr) {
-                anyhow::bail!("Address is already pending");
-            }
-        }
-
         if let Entry::Occupied(entry) = self.candidates.entry(peer_id) {
             if entry.get().contains(&addr) {
                 anyhow::bail!("Address is already added");
             }
         }
 
-        trace!("Connecting to {:?}", addr);
+        let opts = DialOpts::peer_id(peer_id)
+            .addresses(vec![addr])
+            .condition(PeerCondition::Disconnected)
+            .build();
 
-        let new_addr = addr.clone().with(Protocol::P2p(peer_id.into()));
+        let connection_id = opts.connection_id();
 
-        //Thought: Should we set with a new peer instead and have the condition set to always in the event we are connected but the peer somehow was not
-        //         apart of the list here?
-        self.events.push_back(NetworkBehaviourAction::Dial {
-            opts: DialOpts::unknown_peer_id().address(new_addr).build(),
-        });
+        self.events.push_back(ToSwarm::Dial { opts });
 
         self.pending_candidates
             .entry(peer_id)
             .or_default()
-            .push(addr);
+            .push(connection_id);
 
         Ok(())
     }
@@ -228,8 +197,8 @@ impl AutoRelay {
         })
     }
 
-    pub fn list_reservation_peers(&self) -> impl Iterator<Item = &PeerId> + '_ {
-        self.reservation.keys()
+    pub fn list_reservation(&self) -> impl Iterator<Item = &Reservsation> + '_ {
+        self.reservations.values()
     }
 
     pub fn in_candidate_threshold(&self) -> bool {
@@ -237,7 +206,7 @@ impl AutoRelay {
     }
 
     pub fn in_reservation_threshold(&self) -> bool {
-        !self.reservation.is_empty() && self.reservation.len() <= self.limits.max_reservation
+        !self.reservations.is_empty() && self.reservations.len() <= self.limits.max_reservation
     }
 
     pub fn avg_rtt(&self, peer_id: PeerId) -> Option<u128> {
@@ -258,41 +227,61 @@ impl AutoRelay {
     }
 
     pub fn select_candidate(&mut self, peer_id: PeerId) {
-        // We remove to prevent duplications
-        if let Some(addrs) = self.candidates.get(&peer_id).cloned() {
-            if self.pending_reservation_peer.insert(peer_id) {
-                self.events.push_back(NetworkBehaviourAction::GenerateEvent(
-                    Event::ReservationSelected { peer_id, addrs },
-                ));
-            }
+        if self
+            .list_reservation()
+            .any(|reservation| reservation.peer_id == peer_id)
+        {
+            return;
         }
-    }
 
-    pub fn remove_reservation(&mut self, peer_id: PeerId) {
-        if let Some(_addrs) = self.candidates.get(&peer_id) {
-            if let Some(map) = self.reservation.get(&peer_id) {
-                for listener in map.keys() {
-                    self.events.push_back(NetworkBehaviourAction::GenerateEvent(
-                        Event::ReservationRemoved {
-                            peer_id,
-                            listener: *listener,
-                        },
-                    ));
+        if self.pending_reservation.contains_key(&peer_id) {
+            return;
+        }
+
+        if let Some(addrs) = self.candidates.get(&peer_id).cloned() {
+            let addrs = addrs
+                .iter()
+                .map(|addr| {
+                    let mut addr = addr.clone();
+                    if !matches!(addr.iter().last(), Some(Protocol::P2pCircuit)) {
+                        addr.push(Protocol::P2pCircuit);
+                    }
+                    addr
+                })
+                .collect::<Vec<_>>();
+
+            for addr in addrs {
+                let opts = ListenOpts::new(addr);
+                let listener_id = opts.listener_id();
+
+                if let Entry::Vacant(entry) = self.pending_reservation.entry(peer_id) {
+                    entry.insert(listener_id);
+                    self.events.push_back(ToSwarm::ListenOn { opts });
                 }
             }
         }
     }
 
+    #[allow(dead_code)]
+    fn remove_reservation(&mut self, peer_id: PeerId) {
+        if !self.candidates.contains_key(&peer_id) {
+            return;
+        }
+
+        for (listener_id, _) in self
+            .reservations
+            .iter()
+            .filter(|(_, reservation)| reservation.peer_id == peer_id)
+        {
+            self.events
+                .push_back(ToSwarm::RemoveListener { id: *listener_id });
+        }
+    }
+
     pub fn remove_all_reservation(&mut self) {
-        for (peer_id, listener_map) in &self.reservation {
-            for listener in listener_map.keys() {
-                self.events.push_back(NetworkBehaviourAction::GenerateEvent(
-                    Event::ReservationRemoved {
-                        peer_id: *peer_id,
-                        listener: *listener,
-                    },
-                ));
-            }
+        for listener_id in self.reservations.keys() {
+            self.events
+                .push_back(ToSwarm::RemoveListener { id: *listener_id });
         }
     }
 
@@ -316,9 +305,7 @@ impl AutoRelay {
         ));
 
         self.events
-            .push_back(NetworkBehaviourAction::GenerateEvent(Event::FindProviders(
-                tx,
-            )));
+            .push_back(ToSwarm::GenerateEvent(Event::FindProviders(tx)));
     }
 
     // This will select a candidate with the lowest ping
@@ -335,7 +322,7 @@ impl AutoRelay {
             return;
         }
 
-        if self.reservation.len() >= self.limits.max_reservation {
+        if self.reservations.len() >= self.limits.max_reservation {
             warn!("Reservation is at its threshold. Will not continue with select");
             return;
         }
@@ -344,9 +331,12 @@ impl AutoRelay {
         let mut last_rtt: Option<Duration> = None;
 
         for peer_id in self.candidates.keys() {
-            if self.reservation.contains_key(peer_id)
+            if self
+                .reservations
+                .iter()
+                .any(|(_, reservation)| reservation.peer_id.eq(peer_id))
                 || self.blacklist.contains_key(peer_id)
-                || self.pending_reservation_peer.contains(peer_id)
+                || self.pending_reservation.contains_key(peer_id)
             {
                 continue;
             }
@@ -373,11 +363,15 @@ impl AutoRelay {
             return;
         };
 
-        if self.pending_reservation_peer.contains(&peer_id) {
+        if self.pending_reservation.contains_key(&peer_id) {
             return;
         }
 
-        if self.reservation.get(&peer_id).is_some() {
+        if self
+            .reservations
+            .iter()
+            .any(|(_, reservation)| reservation.peer_id.eq(&peer_id))
+        {
             return;
         }
 
@@ -394,7 +388,7 @@ impl AutoRelay {
             return;
         }
 
-        if self.reservation.len() >= self.limits.max_reservation {
+        if self.reservations.len() >= self.limits.max_reservation {
             warn!("Reservation is at its threshold. Will not continue with selection");
             return;
         }
@@ -408,7 +402,11 @@ impl AutoRelay {
                 return;
             };
 
-        if self.reservation.get(candidate).is_some() {
+        if self
+            .reservations
+            .iter()
+            .any(|(_, r)| r.peer_id == *candidate)
+        {
             return;
         }
 
@@ -425,10 +423,6 @@ impl AutoRelay {
                 })
                 .or_insert([Duration::from_millis(0), Duration::from_millis(0), rtt]);
         }
-    }
-
-    pub fn inject_listener_id(&mut self, id: ListenerId, addr: Multiaddr) {
-        self.reservation_id.entry(id).or_default().push(addr)
     }
 
     pub fn inject_candidate(&mut self, peer_id: PeerId, addrs: Vec<Multiaddr>) {
@@ -468,11 +462,6 @@ impl AutoRelay {
         match self.candidates.entry(peer_id) {
             Entry::Vacant(entry) => {
                 entry.insert(filtered_addrs.clone());
-                self.events
-                    .push_back(NetworkBehaviourAction::GenerateEvent(Event::Added {
-                        peer_id,
-                        addr: filtered_addrs,
-                    }));
             }
             Entry::Occupied(mut entry) => {
                 *entry.get_mut() = filtered_addrs;
@@ -491,21 +480,22 @@ impl AutoRelay {
                 error,
                 ..
             } => {
-                let listeners = self.reservation.remove(&relay_peer_id);
-                self.candidates.remove(&relay_peer_id);
+                let listeners = self
+                    .reservations
+                    .iter()
+                    .filter(|(_, reservation)| reservation.peer_id == relay_peer_id)
+                    .map(|(listener_id, _)| listener_id)
+                    .copied()
+                    .collect::<Vec<_>>();
+
                 self.blacklist.insert(relay_peer_id, None);
+
                 log::error!("Reservation request failed for {relay_peer_id}: {error}");
-                if let Some(listeners) = listeners {
-                    for (id, _) in listeners {
-                        if let Some(_addr) = self.reservation_id.remove(&id) {
-                            self.events.push_back(NetworkBehaviourAction::GenerateEvent(
-                                Event::ReservationRemoved {
-                                    peer_id: relay_peer_id,
-                                    listener: id,
-                                },
-                            ));
-                        }
+                for id in listeners {
+                    if self.reservations.remove(&id).is_none() {
+                        continue;
                     }
+                    self.events.push_back(ToSwarm::RemoveListener { id });
                 }
             }
             e => info!("Relay Client Event: {e:?}"),
@@ -513,9 +503,9 @@ impl AutoRelay {
     }
 }
 
-impl NetworkBehaviour for AutoRelay {
+impl NetworkBehaviour for Behaviour {
     type ConnectionHandler = DummyConnectionHandler;
-    type OutEvent = Event;
+    type ToSwarm = Event;
 
     fn handle_established_inbound_connection(
         &mut self,
@@ -529,11 +519,31 @@ impl NetworkBehaviour for AutoRelay {
 
     fn handle_established_outbound_connection(
         &mut self,
-        _: ConnectionId,
-        _: PeerId,
-        _: &Multiaddr,
-        _: Endpoint,
+        connection_id: ConnectionId,
+        peer_id: PeerId,
+        address: &Multiaddr,
+        endpoint: Endpoint,
     ) -> Result<THandler<Self>, ConnectionDenied> {
+        if let Entry::Occupied(mut e) = self.pending_candidates.entry(peer_id) {
+            if matches!(endpoint, Endpoint::Dialer) {
+                let entry = e.get_mut();
+                if let Some(index) = entry.iter().position(|id| connection_id.eq(id)) {
+                    entry.remove(index);
+
+                    self.candidates
+                        .entry(peer_id)
+                        .or_default()
+                        .push(address.clone());
+
+                    self.candidates_connection
+                        .insert(connection_id, address.clone());
+                }
+
+                if entry.is_empty() {
+                    e.remove();
+                }
+            }
+        }
         Ok(DummyConnectionHandler)
     }
     fn on_connection_handler_event(
@@ -547,51 +557,6 @@ impl NetworkBehaviour for AutoRelay {
     #[allow(clippy::collapsible_match)]
     fn on_swarm_event(&mut self, event: swarm::FromSwarm<Self::ConnectionHandler>) {
         match event {
-            swarm::FromSwarm::ConnectionEstablished(ConnectionEstablished {
-                peer_id,
-                connection_id,
-                endpoint,
-                ..
-            }) => {
-                //Note: Because we are not able to obtain the protocols of the connected peer
-                //      here, we will not be able to every peer injected into this event as
-                //      a candidate. Instead, we will rely on listening on the swarm
-                //      and injecting the peer information here if they support v2 relay STOP protocol
-                if let Entry::Occupied(mut entry) = self.pending_candidates.entry(peer_id) {
-                    if let ConnectedPoint::Dialer { address, .. } = endpoint {
-                        let addresses = entry.get_mut();
-
-                        let (_, address_without_peer) =
-                            extract_peer_id_from_multiaddr(address.clone());
-                        if !addresses.contains(&address_without_peer) {
-                            return;
-                        }
-
-                        if let Some(index) =
-                            addresses.iter().position(|x| *x == address_without_peer)
-                        {
-                            addresses.swap_remove(index);
-                            if addresses.is_empty() {
-                                entry.remove();
-                            }
-                        }
-
-                        self.candidates_connection
-                            .insert(connection_id, address.clone());
-
-                        self.candidates
-                            .entry(peer_id)
-                            .or_default()
-                            .push(address_without_peer.clone());
-
-                        self.events
-                            .push_back(NetworkBehaviourAction::GenerateEvent(Event::Added {
-                                peer_id,
-                                addr: vec![address_without_peer],
-                            }))
-                    }
-                }
-            }
             swarm::FromSwarm::ConnectionClosed(ConnectionClosed {
                 peer_id,
                 connection_id,
@@ -613,38 +578,24 @@ impl NetworkBehaviour for AutoRelay {
                     }
                 }
             }
-            swarm::FromSwarm::DialFailure(DialFailure { peer_id, error, .. }) => {
+            swarm::FromSwarm::DialFailure(DialFailure {
+                peer_id,
+                error: _,
+                connection_id,
+            }) => {
                 if let Some(peer_id) = peer_id {
                     if let Entry::Occupied(mut entry) = self.pending_candidates.entry(peer_id) {
-                        let addresses = entry.get_mut();
+                        let connections = entry.get_mut();
 
-                        match error {
-                            DialError::Transport(multiaddrs) => {
-                                for (addr, _) in multiaddrs {
-                                    let (peer, maddr) =
-                                        extract_peer_id_from_multiaddr(addr.clone());
-                                    if let Some(peer) = peer {
-                                        if peer != peer_id {
-                                            //Note: Unlikely to happen but a precaution
-                                            //TODO: Maybe panic here if there is ever a mismatch to note as a bug
-                                            warn!("PeerId mismatch. {peer} != {peer_id}");
-                                        }
-                                    }
+                        connections.retain(|id| *id != connection_id);
 
-                                    if let Some(pos) = addresses.iter().position(|a| *a == maddr) {
-                                        addresses.swap_remove(pos);
-                                    }
-                                }
-                            }
-                            _e => {}
-                        }
-
-                        if addresses.is_empty() {
+                        if connections.is_empty() {
                             entry.remove();
                         }
                     }
                 }
             }
+            swarm::FromSwarm::NewListener(NewListener { listener_id: _ }) => {}
             swarm::FromSwarm::NewListenAddr(NewListenAddr { listener_id, addr }) => {
                 if !addr
                     .iter()
@@ -654,77 +605,70 @@ impl NetworkBehaviour for AutoRelay {
                     return;
                 }
 
-                if let Entry::Occupied(mut entry) = self.reservation_id.entry(listener_id) {
-                    let mut addr = addr.clone();
+                dbg!(addr);
 
-                    //not sure if we want to store the p2p protocol but for now strip it out
-                    let Some(Protocol::P2p(_)) = addr.pop() else {
-                    return;
-                };
-
-                    // Comparing entry against addr from event
-                    if !entry.get().contains(&addr) {
+                let peer_id = match self
+                    .pending_reservation
+                    .iter()
+                    .find(|(_, id)| listener_id.eq(id))
+                {
+                    Some((peer_id, _)) => *peer_id,
+                    None => {
                         return;
                     }
-
-                    entry.get_mut().retain(|a| addr.ne(a));
-
-                    let Some(Protocol::P2pCircuit) = addr.pop() else {
-                    return;
                 };
 
-                    let Some(peer_id) = peer_id_from_multiaddr(addr.clone()) else {
-                    return;
-                };
+                self.pending_reservation.remove(&peer_id);
 
-                    if let Some(listeners) = self.reservation.get(&peer_id) {
-                        if listeners.contains_key(&listener_id) {
-                            return;
+                match self.reservations.entry(listener_id) {
+                    Entry::Occupied(mut entry) => {
+                        let reservation = entry.get_mut();
+                        debug_assert_eq!(peer_id, reservation.peer_id);
+                        if !reservation.addr.contains(addr) {
+                            reservation.addr.push(addr.clone());
                         }
                     }
-
-                    self.pending_reservation_peer.remove(&peer_id);
-
-                    match self.reservation.entry(peer_id) {
-                        Entry::Occupied(mut entry) => {
-                            entry.get_mut().insert(listener_id, addr.clone());
-                        }
-                        Entry::Vacant(entry) => {
-                            let mut listeners = HashMap::new();
-                            listeners.insert(listener_id, addr.clone());
-                            entry.insert(listeners);
-                        }
-                    };
-                    if entry.get().is_empty() {
-                        entry.remove();
+                    Entry::Vacant(entry) => {
+                        entry.insert(Reservsation {
+                            peer_id,
+                            addr: vec![addr.clone()],
+                        });
                     }
                 }
             }
             swarm::FromSwarm::ExpiredListenAddr(ExpiredListenAddr { listener_id, .. }) => {
-                if let Some(_entry) = self.reservation_id.remove(&listener_id) {
-                    //TODO:
-                }
-                for (_, map) in self.reservation.iter_mut() {
-                    map.remove(&listener_id);
+                if let Entry::Occupied(entry) = self.reservations.entry(listener_id) {
+                    entry.remove();
                 }
             }
-            swarm::FromSwarm::ListenerError(ListenerError { listener_id, err }) => {
-                self.pending_reservation_id.remove(&listener_id);
-                if let Some(_addr) = self.reservation_id.remove(&listener_id) {
-                    log::error!("Error listening to relay: {err}");
+            swarm::FromSwarm::ListenerError(ListenerError {
+                listener_id,
+                err: _,
+            }) => {
+                let peer_id = match self
+                    .pending_reservation
+                    .iter()
+                    .find(|(_, id)| listener_id.eq(id))
+                {
+                    Some((peer_id, _)) => *peer_id,
+                    None => {
+                        return;
+                    }
+                };
+
+                self.pending_reservation.remove(&peer_id);
+
+                // Incase `FromSwarm::ListenerError` is emitted for an existing listener
+                if let Entry::Occupied(entry) = self.reservations.entry(listener_id) {
+                    entry.remove();
                 }
             }
             swarm::FromSwarm::ListenerClosed(ListenerClosed {
                 listener_id,
-                reason,
+                reason: _,
             }) => {
-                if let Err(e) = reason {
-                    log::error!("Error closing listener: {e}");
-                }
-
-                self.reservation_id.remove(&listener_id);
-                for (_, map) in self.reservation.iter_mut() {
-                    map.remove(&listener_id);
+                if let Entry::Occupied(entry) = self.reservations.entry(listener_id) {
+                    entry.remove();
                 }
             }
             _ => {}
@@ -735,12 +679,12 @@ impl NetworkBehaviour for AutoRelay {
         &mut self,
         cx: &mut Context,
         _: &mut impl PollParameters,
-    ) -> Poll<NetworkBehaviourAction> {
+    ) -> Poll<swarm::ToSwarm<Event, THandlerInEvent<Self>>> {
         if let Some(event) = self.events.pop_front() {
             return Poll::Ready(event);
         }
 
-        if matches!(self.nat_status, Nat::Public) && self.reservation_amount() > 0 {
+        if matches!(self.nat_status, Nat::Public) && !self.reservations.is_empty() {
             self.remove_all_reservation();
         }
 
@@ -748,7 +692,7 @@ impl NetworkBehaviour for AutoRelay {
             while let Poll::Ready(Some(_)) = self.interval.poll_next_unpin(cx) {
                 if self.candidates.is_empty() {
                     self.events
-                        .push_back(NetworkBehaviourAction::GenerateEvent(Event::FindCandidates));
+                        .push_back(ToSwarm::GenerateEvent(Event::FindCandidates));
                 }
                 if self.in_candidate_threshold() && !self.in_reservation_threshold() {
                     self.select_candidate_low_rtt();
@@ -801,6 +745,7 @@ impl NetworkBehaviour for AutoRelay {
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn peer_id_from_multiaddr(addr: Multiaddr) -> Option<PeerId> {
     let (peer, _) = extract_peer_id_from_multiaddr(addr);
     peer
@@ -809,10 +754,7 @@ pub(crate) fn peer_id_from_multiaddr(addr: Multiaddr) -> Option<PeerId> {
 #[allow(dead_code)]
 pub(crate) fn extract_peer_id_from_multiaddr(mut addr: Multiaddr) -> (Option<PeerId>, Multiaddr) {
     match addr.pop() {
-        Some(Protocol::P2p(hash)) => match PeerId::from_multihash(hash) {
-            Ok(id) => (Some(id), addr),
-            _ => (None, addr),
-        },
+        Some(Protocol::P2p(peer_id)) => (Some(peer_id), addr),
         _ => (None, addr),
     }
 }

@@ -12,7 +12,7 @@ exclude = [".gitignore"]
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-libp2p = { version = "0.51", features = ["relay"] }
+libp2p = { version = "0.52", features = ["relay"] }
 # TODO: Use Cid and Multihash directly
 # libipld = "0.15"
 thiserror = "1.0"
@@ -25,8 +25,14 @@ rand = "0.8"
 
 [dev-dependencies]
 libipld = "0.15"
-libp2p = { version = "0.51", features = ["full"] }
+libp2p = { version = "0.52", features = ["full"] }
+libp2p-quic = { git = "https://github.com/libp2p/rust-libp2p", rev = "2910c985e8ab75b52d36701b9c7717ebf0fd8585", features = ["async-std"]}
 async-std = { version = "1", features = ["attributes"] }
 clap = { version = "4.0", features = ["derive"] }
 env_logger = "0.10"
-libp2p-nat = { version = "0.2", default-features = false, features = ["async-std"] }
+# libp2p-nat = { version = "0.2", default-features = false, features = [
+#     "async-std",
+# ] }
+
+[patch.crates-io]
+libp2p = { version = "0.52", git = "https://github.com/libp2p/rust-libp2p", rev = "2910c985e8ab75b52d36701b9c7717ebf0fd8585" }
